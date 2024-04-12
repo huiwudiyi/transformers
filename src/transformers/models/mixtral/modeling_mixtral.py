@@ -102,22 +102,23 @@ def load_balancing_loss_func(
 
     if isinstance(gate_logits, tuple):
         compute_device = gate_logits[0].device
+        # 按照行将 layer_gate 数据进行 cat
         concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
-
+    # 计算 softmax 
     routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
-
+    # 寻找top k expert 的数值 以及  index
     _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-
+    # 将选中的expert 变成 one_hot; 根据num_experts 构建出来二维举证，然后 使用selected_experts指定选中的expert
     expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
-
+    # 
     if attention_mask is None:
         # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=0) # 计算 每个expert 被token的选中的概率
 
         # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+        router_prob_per_expert = torch.mean(routing_weights, dim=0) #计算 每个expert logits的平均值
     else:
-        batch_size, sequence_length = attention_mask.shape
+        batch_size, sequence_length = attention_mask.shape  #
         num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
 
         # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
@@ -172,7 +173,7 @@ class MixtralRMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-
+    # 这里将 hidden_state的平方和  1/开根号
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
@@ -189,25 +190,29 @@ class MixtralRotaryEmbedding(nn.Module):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
+        # 1 / ( base.pow([0,dim,2]) / dim )
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Build here to make `torch.jit.trace` work.
-        self._set_cos_sin_cache(
+        self._set_cos_sin_cache( # 计算 cos 和sin的距离变化
             seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
         )
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
+        # range(0, max_seq_len_cached)
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=torch.int64).type_as(self.inv_freq)
-
+        # t^T * 1 / ( base.pow([0,dim,2]) / dim )
+        #相当与绝对位置的装置 * 1 / ( base.pow([0,dim,2]) / dim )
         freqs = torch.outer(t, self.inv_freq)
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
+        # 绝对位置变换 的cos 和 sin 的值
         self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
-    def forward(self, x, seq_len=None):
+    def forward(self, x, seq_len=None): 
         # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
@@ -221,9 +226,10 @@ class MixtralRotaryEmbedding(nn.Module):
 # Copied from transformers.models.llama.modeling_llama.rotate_half
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    x1 = x[..., : x.shape[-1] // 2] #  (bsz, num_key_value_heads, q_len, head_size)
+    x2 = x[..., x.shape[-1] // 2 :] 
+    # 这里将 最后一维 切分成两部分，然后将后面的 取负 拼到前面
+    return torch.cat((-x2, x1), dim=-1)  # [[11,12,13,14], [15, 16, 17, 18]] => [[-13, -14,  11,  12],[-17, -18,  15,  16]]
 
 
 # Copied from transformers.models.mistral.modeling_mistral.apply_rotary_pos_emb
@@ -231,7 +237,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
-        q (`torch.Tensor`): The query tensor.
+        q (`torch.Tensor`): The query tensor.  q = (bsz, num_key_value_heads, q_len, head_size)
         k (`torch.Tensor`): The key tensor.
         cos (`torch.Tensor`): The cosine part of the rotary embedding.
         sin (`torch.Tensor`): The sine part of the rotary embedding.
@@ -248,10 +254,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim) # 第 position_ids 行 cos 数据 
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim) # 第 position_ids 行 sin 数据
+    q_embed = (q * cos) + (rotate_half(q) * sin) # q * cos(相当与绝对位置的装置 * 1 / ( base.pow([0,dim,2]) / dim )) +  (-after_half(q), pre_half(q)) * 1 / ( base.pow([0,dim,2]) / dim ))
+    k_embed = (k * cos) + (rotate_half(k) * sin) # 矩阵转置
     return q_embed, k_embed
 
 
@@ -301,13 +307,13 @@ class MixtralAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False) # num_heads * head_dim
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False) # num_key_value_heads * head_dim
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False) # num_key_value_heads * head_dim
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False) # num_heads * head_dim
 
-        self.rotary_emb = MixtralRotaryEmbedding(
-            self.head_dim,
+        self.rotary_emb = MixtralRotaryEmbedding( 
+            self.head_dim, # 
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
@@ -334,7 +340,7 @@ class MixtralAttention(nn.Module):
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
-
+        #(bsz,q_len, num_key_value_heads, num_heads)
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -348,19 +354,23 @@ class MixtralAttention(nn.Module):
                     "with a layer index."
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # 在Value 层面上 进行 rotary 计算 (bsz, num_key_value_heads, q_len, num_heads)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len) # 单纯的提取 相对位置的 
+        # (bsz, num_key_value_heads, q_len, num_heads) 
+        # 进行 Q和K 的矩阵的转置
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
+        # 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         # repeat k/v heads if n_kv_heads < n_heads
+        # G-KQV 就是让K repeat 之后 然后和Q进行相乘 也就是说Q相邻的token 看到的K和V是一样的
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-
+        # 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
+；
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
                 f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
@@ -875,27 +885,34 @@ class MixtralSparseMoeBlock(nn.Module):
         # 逐个计算 expert
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]  # 抽取第idx个 topk 个expert 的index
-            # 通过 idx 和top_x 共同筛选出来 topK expert 的index
+            # 通过 idx 和 top_x 共同筛选出来 topK expert 的index
             idx, top_x = torch.where(expert_mask[expert_idx]) 
             
             if top_x.shape[0] == 0:
                 continue
 
             # in torch it is faster to index using lists than torch tensors
-            top_x_list = top_x.tolist() # 
-            idx_list = idx.tolist() #
+            top_x_list = top_x.tolist() #  选中的 sequence index
+            idx_list = idx.tolist() # batch_size
 
             # Index the correct hidden states and compute the expert hidden state for
             # the current expert. We need to make sure to multiply the output hidden
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
 
-            # 
+            # 筛选出 sequen中中的 embedding
             current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+            # 计算每个token经过 expert之后， 乘上 路由weight 得到 具体的命中该 expert 的logits
             current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
 
             # However `index_add_` only support torch tensors for indexing so we'll use
             # the `top_x` tensor here.
+            # index_add_ 这里指的是 dim=0 这个维度，将current_hidden_states 在dim这个维度上的数据，按照 topx的index 加到固定的位置
+            # 比如 x = torch.zeros([3,3]) y = [[1,2,3], [4,5,6],[7,8,9]], topx = [1,1,2]
+            # 那么 我们就会将 [1,2,3] 和 [4,5,6] 加到 1行上， [7,8,9] 加到 2 上面去
+            # 最终的结果 [[0,0,0], [5,7,9], [7,8,9]]
+            # 这里就是相当于将 数据按照topx的 数据相加
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+        # 这里最终得到的是通过 top k expert 之后的数据，矩阵
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
 
@@ -1000,6 +1017,7 @@ MIXTRAL_START_DOCSTRING = r"""
     MIXTRAL_START_DOCSTRING,
 )
 # Copied from transformers.models.mistral.modeling_mistral.MistralPreTrainedModel with Mistral->Mixtral
+
 class MixtralPreTrainedModel(PreTrainedModel):
     config_class = MixtralConfig
     base_model_prefix = "model"
